@@ -43,6 +43,10 @@ class ClientHandler:
         self._last_config_sent_at = 0.0
         self._last_config_id = 0
         self.last_activity: float = time.time()
+        self.last_activity_monotonic: float = time.monotonic()
+        self._mqtt_bridge = mqtt_bridge
+
+    def set_mqtt_bridge(self, mqtt_bridge) -> None:
         self._mqtt_bridge = mqtt_bridge
 
     @property
@@ -99,6 +103,7 @@ class ClientHandler:
             if not chunk:
                 break
             self.last_activity = time.time()
+            self.last_activity_monotonic = time.monotonic()
             buffer += chunk
 
             while True:

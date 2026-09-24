@@ -1,8 +1,9 @@
-﻿meshtastic
-protobuf
+﻿# Requires Python 3.10+ (uses X | Y type syntax). Docker image uses python:3.14-slim.
+meshtastic>=2.5
+protobuf>=4.0
 pyyaml>=6.0
 pydantic>=2.0
 pyserial-asyncio>=0.6
 zeroconf>=0.132.0
-aiomqtt>=23.0.0
+aiomqtt==2.5.1
 pycryptodome>=3.20.0

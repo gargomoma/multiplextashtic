@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.1.0). Defaults to src/__init__.py version."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest tests -q
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag and version
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VER=$(python -c "import src; print(src.__version__)")
+            TAG="v$VER"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VER_FILE=$(python -c "import src; print(src.__version__)")
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VER_FILE" >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG (src/__init__.py = $VER_FILE)"
+
+      - name: Version must match tag
+        run: |
+          test "v${{ steps.meta.outputs.version }}" = "${{ steps.meta.outputs.tag }}" \
+            || (echo "::error::Tag ${{ steps.meta.outputs.tag }} != src/__init__.py v${{ steps.meta.outputs.version }}. Bump __version__ first."; exit 1)
+
+      - name: Verify Docker image builds
+        run: docker build -t multiplextashtic:${{ steps.meta.outputs.tag }} .
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping create."
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi

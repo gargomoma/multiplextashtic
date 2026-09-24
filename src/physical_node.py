@@ -29,10 +29,16 @@ class PhysicalNodeManager:
         self._metadata_captured = asyncio.Event()
         self._last_data_time: float = 0.0
         self._on_reconnect: Callable[[], Awaitable[None]] | None = None
+        self._did_initial_connect = False
 
         self.my_node_num = 0
         self.my_info = None
         self.metadata = None
+
+    def _start_reconnect_loop(self) -> None:
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     async def connect(self):
         self._running = True
@@ -40,7 +46,7 @@ class PhysicalNodeManager:
             await self._do_connect()
         except Exception:
             if self._config.reconnect.enabled:
-                self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+                self._start_reconnect_loop()
 
     async def _do_connect(self):
         if self._config.connection_type == "serial":
@@ -61,8 +67,9 @@ class PhysicalNodeManager:
         self._metadata_captured.clear()
         logger.info(f"Connected to {self._config.connection_type} node")
         self._read_loop_task = asyncio.create_task(self._read_loop())
-        if self._on_reconnect:
+        if self._did_initial_connect and self._on_reconnect:
             asyncio.create_task(self._on_reconnect())
+        self._did_initial_connect = True
 
     async def _send_want_config(self):
         import random
@@ -88,19 +95,56 @@ class PhysicalNodeManager:
 
     async def _read_loop(self):
         buffer = b""
-        idle_timeout = self._config.tcp_idle_timeout if self._config.connection_type == "tcp" else 0
+        is_serial = self._config.connection_type == "serial"
+        # Idle watchdog. TCP has always had one (tcp_idle_timeout); serial did
+        # NOT, which meant a USB CDC re-enumeration (the /dev/ttyACM* device
+        # silently going away and coming back under a new fd) left this loop
+        # reading a dead handle forever -- no EOF, no error -- so reconnect never
+        # fired. For serial we now:
+        #   1) actively poke the link (want_config) after `poke_timeout` of
+        #      silence to distinguish a quiet mesh from a dead fd, then
+        #   2) declare the link dead after `idle_timeout` and trigger reconnect,
+        #      which re-opens the port fresh on the current device node.
+        # The local node emits telemetry ~every 60s, so idle_timeout is set well
+        # above that (default 90s) to avoid false positives during quiet periods.
+        if is_serial:
+            idle_timeout = self._config.serial_idle_timeout
+            poke_timeout = self._config.serial_poke_timeout
+        else:
+            idle_timeout = self._config.tcp_idle_timeout
+            poke_timeout = 0
+        poked = False
         while self._running and self._connected:
             try:
                 chunk = await asyncio.wait_for(self._reader.read(4096), timeout=1.0)
                 if not chunk:
                     break
                 self._last_data_time = time.time()
+                poked = False
             except asyncio.TimeoutError:
-                if idle_timeout > 0 and time.time() - self._last_data_time > idle_timeout:
-                    logger.warning(f"No data from physical node for {idle_timeout}s, assuming disconnect")
+                silent = time.time() - self._last_data_time
+                # Serial: poke the link once before giving up on it.
+                if is_serial and poke_timeout > 0 and not poked and silent > poke_timeout:
+                    logger.info(
+                        f"No serial data for {int(silent)}s; poking link with want_config"
+                    )
+                    try:
+                        await self._send_want_config()
+                    except Exception as e:
+                        logger.warning(f"Serial poke failed ({e!r}); treating link as down")
+                        self._connected = False
+                        if self._running and self._config.reconnect.enabled:
+                            self._start_reconnect_loop()
+                        return
+                    poked = True
+                if idle_timeout > 0 and silent > idle_timeout:
+                    logger.warning(
+                        f"No data from physical node for {int(silent)}s, assuming "
+                        f"disconnect (likely USB re-enumeration); reconnecting"
+                    )
                     self._connected = False
                     if self._running and self._config.reconnect.enabled:
-                        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+                        self._start_reconnect_loop()
                     return
                 continue
             except Exception as e:
@@ -118,7 +162,7 @@ class PhysicalNodeManager:
         self._connected = False
         logger.warning("Read loop ended")
         if self._running and self._config.reconnect.enabled:
-            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+            self._start_reconnect_loop()
 
     def _maybe_capture_my_info(self, from_radio_bytes: bytes) -> None:
         try:

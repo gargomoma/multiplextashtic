@@ -16,6 +16,13 @@ _PORTNUM_LOOKUP = portnums_pb2._PORTNUM.values_by_number
 def setup_logging(log_cfg: cfg.LoggingConfig) -> logging.Logger:
     logger = logging.getLogger("multiplextashtic")
     logger.setLevel(getattr(logging, log_cfg.level))
+    # Avoid duplicate handlers across reloads / test invocations.
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
 
     formatter = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -32,12 +39,22 @@ def setup_logging(log_cfg: cfg.LoggingConfig) -> logging.Logger:
 
     if log_cfg.file:
         log_path = Path(log_cfg.file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_path, maxBytes=5 * 1024 * 1024, backupCount=3
-        )
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_path, maxBytes=5 * 1024 * 1024, backupCount=3
+            )
+        except OSError as e:
+            # Never let logging setup kill startup (read-only FS, bad path):
+            # fall back to console-only and say so on stderr.
+            print(
+                f"multiplextashtic: cannot set up log file {log_path}: {e}; "
+                "continuing console-only",
+                file=sys.stderr,
+            )
+        else:
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
 
     return logger
 
@@ -77,6 +94,8 @@ def print_banner(logger: logging.Logger) -> None:
 
 
 async def main() -> None:
+    if sys.version_info < (3, 10):
+        raise RuntimeError(f"Multiplextashtic requires Python 3.10+, got {sys.version}")
     args = parse_args()
     app_config = cfg.AppConfig.from_yaml(args.config)
     logger = setup_logging(app_config.logging)
@@ -103,6 +122,9 @@ async def main() -> None:
     config_capture = ConfigCapture()
 
     async def _on_physical_reconnect():
+        if server is None:
+            logger.warning("Reconnect handler: server not ready, skipping refresh")
+            return
         logger.info("Physical node reconnected, re-capturing config")
         try:
             ok = await phys_mgr.wait_for_my_info(timeout=15.0)
@@ -165,6 +187,26 @@ async def main() -> None:
         server = TCPServer(app_config.server, phys_mgr, app_config, cache, config_capture, mqtt_bridge)
         phys_mgr.subscribe(lambda pkt: _route_broadcast(pkt, server, cache, logger, router))
 
+        incoming_task = asyncio.create_task(phys_mgr.process_incoming())
+
+        # Once per boot: auto-provision node MQTT proxy when bridged (local node only).
+        provision_snapshot = None
+        if app_config.mqtt_bridge.enabled and not args.mock:
+            from src.node_provision import ensure_mqtt_proxy
+            try:
+                metadata = getattr(phys_mgr, "metadata", None)
+                has_net = None
+                if metadata is not None:
+                    has_net = bool(
+                        getattr(metadata, "hasWifi", False)
+                        or getattr(metadata, "hasEthernet", False)
+                    )
+                result = await ensure_mqtt_proxy(phys_mgr, node_num, has_net=has_net)
+                logger.info(f"Node provision result: {result}")
+                provision_snapshot = result.get("snapshot")
+            except Exception as e:
+                logger.warning(f"Node provision failed, continuing degraded: {e}")
+
         if app_config.mqtt_bridge.enabled:
             from src.mqtt_bridge import MqttBridge
             mqtt_bridge = MqttBridge(app_config, node_num=node_num)
@@ -185,14 +227,26 @@ async def main() -> None:
                 logger.debug(f"MQTT bridge injected downlink to mesh from {topic}")
             await mqtt_bridge.start(downlink_callback=_mqtt_downlink)
             logger.info("MQTT bridge started")
-            router._mqtt_bridge = mqtt_bridge
-            server._mqtt_bridge = mqtt_bridge
+            router.set_mqtt_bridge(mqtt_bridge)
+            server.set_mqtt_bridge(mqtt_bridge)
             cache.mqtt_bridge = mqtt_bridge
+            if provision_snapshot is not None:
+                mqtt_bridge.set_node_mqtt_snapshot(provision_snapshot)
+                logger.info(
+                    "MQTT coexistence: node reports to "
+                    f"{provision_snapshot.get('address') or '(default)'} / "
+                    f"bridge reports to {app_config.mqtt_bridge.broker}"
+                )
 
         from src.mdns_service import MDNSService
-        mdns = MDNSService(app_config, short_name=short_name, node_id=node_id)
+        mdns = MDNSService(
+            app_config,
+            short_name=short_name,
+            node_id=node_id,
+            node_id_provider=lambda: f"!{(phys_mgr.my_node_num or 0):08x}",
+            is_connected=lambda: bool(getattr(phys_mgr, "_connected", False)),
+        )
 
-        incoming_task = asyncio.create_task(phys_mgr.process_incoming())
         await server.start()
 
         node_short = (
@@ -200,7 +254,7 @@ async def main() -> None:
             if cache.node_info else short_name
         )
         mdns.set_short_name(f"V_{node_short}")
-        await mdns.start()
+        mdns_task = asyncio.create_task(mdns.start())
 
         shutdown_event = asyncio.Event()
         await shutdown_event.wait()
@@ -215,9 +269,26 @@ async def main() -> None:
             await mqtt_bridge.stop()
         if incoming_task:
             incoming_task.cancel()
-        if "mdns" in locals():
-            await mdns.stop()
-        await server.stop()
+        mdns_task_obj = locals().get("mdns_task")
+        if mdns_task_obj is not None and not mdns_task_obj.done():
+            mdns_task_obj.cancel()
+            try:
+                await mdns_task_obj
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        mdns_obj = locals().get("mdns")
+        if mdns_obj is not None:
+            try:
+                await mdns_obj.stop()
+            except Exception:
+                pass
+        if server is not None:
+            try:
+                await server.stop()
+            except Exception:
+                pass
         await phys_mgr.disconnect()
         logger.info("Shutdown complete")
 

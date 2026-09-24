@@ -11,13 +11,22 @@ __pycache__/
 
 # Project directories not needed at runtime
 tests/
+tools/
 docs/
 examples/
 yeraze_analysis/
 logs/
+*.log
+.kilo/
 
 # Config — use bind mount
 configs/config.yaml
+configs/config.29.yaml
+
+# Local dev / private planning
+.work/
+openspec/
+.opencode/
 
 # Docker files
 .dockerignore

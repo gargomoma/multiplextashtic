@@ -20,6 +20,7 @@ class MockPhysicalNodeManager:
             "my_node_num": self.my_node_num,
             "reboot_count": 42,
         }
+        self.metadata = None
 
     async def connect(self):
         logger.info("MockPhysicalNode: Connecting (simulated)...")
@@ -45,6 +46,12 @@ class MockPhysicalNodeManager:
 
     async def wait_for_my_info(self, timeout: float = 10.0) -> bool:
         return True
+
+    async def wait_for_metadata(self, timeout: float = 10.0) -> bool:
+        return False
+
+    def set_on_reconnect(self, callback) -> None:
+        pass
 
     def subscribe(self, callback):
         self._callbacks.append(callback)

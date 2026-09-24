@@ -1,5 +1,8 @@
 # Multiplextashtic Configuration
 # Copy this file to config.yaml and customize.
+# Renamed keys fail fast: gateway_enabled -> raw_uplink + standard_mirror;
+# raw_mirror_all -> raw_scope; broker2.msh_only -> broker2.raw_uplink (inverted);
+# broker2.send_raw -> broker2.raw_uplink; broker2.client_id removed (shared mux-v id).
 
 physical_node:
   # Connection type: "serial" (USB) or "tcp" (network)
@@ -15,6 +18,8 @@ physical_node:
 
   baud_rate: 115200
   tcp_idle_timeout: 30         # seconds without data before assuming TCP disconnect (0 = disabled)
+  serial_poke_timeout: 45      # serial: poke link with want_config after Ns silence
+  serial_idle_timeout: 90      # serial: reconnect after Ns silence (USB re-enumeration; keep >60s telemetry)
 
   reconnect:
     enabled: true
@@ -50,18 +55,29 @@ mqtt_bridge:
   broker: "mqtt.meshtastic.org"
   port: 8883
   tls: true
-  username: ""            # MQTT broker user; also used in client-id
+  username: ""            # MQTT broker auth user (never in client-id)
   password: ""            # plaintext in config.yaml (chmod 600)
   uplink_enabled: true    # always uplink when enabled (kill switch)
   downlink_enabled: false # allow MQTT->mesh injection when true
   ignore_ok_to_mqtt: false # true = upload any message ignoring channel flags
-  mqtt_username: ""       # client-id = mux-v{ver}-mqtt_username, else ...-{nodeID}
+  mqtt_username: ""       # client-id: mux-v{ver}-{mqtt_username}-{nodehex}; empty = mux-v{ver}-{nodehex}-{uuid12-per-boot}
   root_topic: "msh"
   raw_root_topic: "raw"   # raw gateway tree root (outside msh/ so apps never see it)
   region: ""              # explicit region (empty = auto: proxy topics > LoRa enum > EU_868)
-  gateway_enabled: false  # publish every serial RF packet, even unknown channels
-  raw_mirror_all: false   # false = raw gets only non-proxy traffic, true = mirror everything
+  raw_uplink: false       # raw-tree gateway (raw/...) to the primary broker; proxy relay (msh/# verbatim) runs independently of this flag
+  raw_scope: "uncovered"  # uncovered = skip proxy-covered packets, all = mirror everything
+  standard_mirror: "auto" # auto = mirror known channels to msh/ iff node/bridge brokers differ; on/off force (stands alone); mirrored msh/ fans out to broker2, raw/ per each leg's raw_uplink+raw_scope
   keepalive: 60
+  # broker2:                # optional secondary broker (dual-MQTT); absent/disabled = single-broker
+  #   enabled: true
+  #   broker: ""
+  #   port: 8883
+  #   tls: true
+  #   username: ""
+  #   password: ""          # gitignored config only, never logged
+  #   keepalive: 60
+  #   raw_uplink: false     # raw-tree gateway (raw/...) to this broker
+  #   raw_scope: "uncovered"  # uncovered = skip proxy-covered packets, all = mirror everything
 
 logging:
   level: "INFO"                  # DEBUG, INFO, WARNING, ERROR

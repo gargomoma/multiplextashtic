@@ -36,6 +36,9 @@ class MessageRouter:
         self._app_config = app_config
         self._mqtt_bridge = mqtt_bridge
 
+    def set_mqtt_bridge(self, mqtt_bridge) -> None:
+        self._mqtt_bridge = mqtt_bridge
+
     async def route_from_client(self, payload: bytes, client_ip: str = "unknown") -> tuple[bool, bytes | None, bytes | None]:
         """Route a ToRadio payload from a client.
 
@@ -104,7 +107,8 @@ class MessageRouter:
                     logger.warning(f"Blocked ADMIN_APP from {client_ip} (no allowlist configured)")
                     return False, None, None
 
-        # Blocked portnums (except ADMIN_APP which is handled above)
+        # Blocked portnums: ADMIN_APP is handled by the whitelist above, so
+        # any other entry in BLOCKED_PORTNUMS is dropped here.
         if portnum is not None and portnum in BLOCKED_PORTNUMS and portnum != portnums_pb2.ADMIN_APP:
             logger.warning(f"Blocked portnum {portnum} from client, silently discarding")
             return False, None, None
@@ -191,29 +195,17 @@ class MessageRouter:
 
         if from_radio.HasField("packet") and self._mqtt_bridge is not None:
             bridge_cfg = self._app_config.mqtt_bridge
-            if bridge_cfg.enabled and bridge_cfg.gateway_enabled:
+            if bridge_cfg.enabled and self._mqtt_bridge.raw_dispatch_wanted():
                 pkt = from_radio.packet
-                covered = self._mqtt_bridge.is_proxy_covered(pkt.channel)
-                should = self._gateway_should_publish(pkt)
                 logger.debug(
-                    f"Router: gateway decision id={pkt.id} ch={pkt.channel} "
-                    f"covered={covered} publish={should}"
+                    f"Router: dispatching raw id={pkt.id} ch={pkt.channel} "
+                    "(per-leg scope decided by bridge)"
                 )
-                if should:
-                    asyncio.create_task(self._mqtt_bridge.publish_packet(pkt))
+                asyncio.create_task(self._mqtt_bridge.publish_packet(pkt))
+            if self._mqtt_bridge.standard_mirror_active():
+                asyncio.create_task(self._mqtt_bridge.publish_standard(pkt))
 
-        return from_radio_bytes
-
-    def _gateway_should_publish(self, packet: mesh_pb2.MeshPacket) -> bool:
-        """Partition gateway vs proxy (plus packet-id safety dedupe).
-
-        mirror_all=true -> everything goes to raw. Otherwise only channels
-        the proxy path doesn't cover (no uplink flag / unknown channel).
-        """
-        bridge_cfg = self._app_config.mqtt_bridge
-        if bridge_cfg.raw_mirror_all:
-            return True
-        return not self._mqtt_bridge.is_proxy_covered(packet.channel)
+            return from_radio_bytes
 
     async def _publish_proxy_to_bridge(self, from_radio: mesh_pb2.FromRadio) -> None:
         try:

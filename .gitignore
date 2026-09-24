@@ -3,6 +3,7 @@
 .opencode/
 openspec/
 tests/
+tools/
 
 # Python
 __pycache__/
@@ -21,3 +22,4 @@ configs/config.yaml
 # OS
 .DS_Store
 Thumbs.db
+configs/config.29.yaml
