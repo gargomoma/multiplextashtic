@@ -14,6 +14,19 @@ BLOCKED_PORTNUMS = {
 
 LOCALHOST_IPS = {"127.0.0.1", "::1", "localhost"}
 
+# FromRadio variants the node only sends in reply to the multiplexer's own
+# want_config_id. Clients get these from the config replay instead; forwarding
+# them would push a ~1000-node dump plus a foreign config_complete_id to every
+# connected app whenever the physical link reconnects.
+# Admin messages that don't change stored settings: apps send set_time_only on
+# every connect, so re-reading the node's config for it would be wasted work.
+NON_SETTINGS_ADMIN_VARIANTS = {"set_time_only"}
+
+CONFIG_DUMP_VARIANTS = {
+    "my_info", "node_info", "config", "moduleConfig", "channel", "metadata",
+    "config_complete_id", "fileInfo", "deviceuiConfig",
+}
+
 
 def _ip_matches_any(client_ip: str, allowed_entries: list[str]) -> bool:
     for entry in allowed_entries:
@@ -114,6 +127,7 @@ class MessageRouter:
             return False, None, None
 
         # Admin command interception (Phase C11)
+        is_admin_write = False
         if portnum == portnums_pb2.ADMIN_APP:
             admin_payload = packet.decoded.payload if packet.decoded else b""
             if admin_payload:
@@ -128,6 +142,9 @@ class MessageRouter:
                     if admin_msg.HasField("add_contact"):
                         logger.warning("Blocked addContact admin message (PKI keystore protection)")
                         return False, None, None
+                    variant = admin_msg.WhichOneof("payload_variant")
+                    is_admin_write = bool(variant) and variant not in NON_SETTINGS_ADMIN_VARIANTS \
+                        and variant.startswith(("set_", "remove_", "commit_"))
                 except Exception:
                     pass
 
@@ -149,6 +166,9 @@ class MessageRouter:
                 raw_payload = new_tr.SerializeToString()
             except Exception as e:
                 logger.warning(f"PKI stripping failed, forwarding original: {e}")
+
+        if is_admin_write and hasattr(self._phys_mgr, "schedule_resync"):
+            self._phys_mgr.schedule_resync()
 
         return True, raw_payload, None
 
@@ -184,8 +204,8 @@ class MessageRouter:
         except Exception:
             return from_radio_bytes
 
-        if from_radio.config_complete_id:
-            logger.debug(f"Router: forwarding config_complete id={from_radio.config_complete_id} to clients")
+        if from_radio.WhichOneof("payload_variant") in CONFIG_DUMP_VARIANTS:
+            return None
 
         if from_radio.HasField("mqttClientProxyMessage"):
             logger.debug("Router: diverting mqttClientProxyMessage to MQTT bridge")
@@ -203,9 +223,9 @@ class MessageRouter:
                 )
                 asyncio.create_task(self._mqtt_bridge.publish_packet(pkt))
             if self._mqtt_bridge.standard_mirror_active():
-                asyncio.create_task(self._mqtt_bridge.publish_standard(pkt))
+                asyncio.create_task(self._mqtt_bridge.publish_standard(from_radio.packet))
 
-            return from_radio_bytes
+        return from_radio_bytes
 
     async def _publish_proxy_to_bridge(self, from_radio: mesh_pb2.FromRadio) -> None:
         try:

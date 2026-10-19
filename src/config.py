@@ -17,7 +17,7 @@ class PhysicalNodeConfig(BaseModel):
     tcp_host: str = "192.168.1.100"
     tcp_port: int = 4403
     baud_rate: int = 115200
-    tcp_idle_timeout: int = 30
+    tcp_idle_timeout: int = 300
     # Serial idle watchdog: a USB CDC re-enumeration leaves the old fd silent
     # with no EOF/error, so without these the serial read loop hangs forever.
     # poke: after this many seconds of silence, actively send want_config.
