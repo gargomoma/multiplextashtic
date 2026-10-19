@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import socket
 import time
 from typing import Callable, Awaitable
 
@@ -9,6 +10,8 @@ from src import config as cfg
 from src.protocol import encode_frame, find_frame
 
 logger = logging.getLogger("multiplextashtic.physical_node")
+
+HEARTBEAT_INTERVAL_SECONDS = 60
 
 
 class PhysicalNodeManager:
@@ -23,17 +26,23 @@ class PhysicalNodeManager:
         self._connected = False
         self._running = False
         self._reconnect_task: asyncio.Task | None = None
+        self._resync_task: asyncio.Task | None = None
         self._read_loop_task: asyncio.Task | None = None
         self._read_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._my_info_captured = asyncio.Event()
         self._metadata_captured = asyncio.Event()
         self._last_data_time: float = 0.0
+        self._last_heartbeat_time: float = 0.0
         self._on_reconnect: Callable[[], Awaitable[None]] | None = None
         self._did_initial_connect = False
 
         self.my_node_num = 0
         self.my_info = None
         self.metadata = None
+        # Raw FromRadio bytes from the node's own config dump, keyed by sub-type
+        # (e.g. "lora", "security", "mqtt"), in the order the firmware sent them.
+        self.config_frames: dict[str, bytes] = {}
+        self.module_config_frames: dict[str, bytes] = {}
 
     def _start_reconnect_loop(self) -> None:
         if self._reconnect_task is not None and not self._reconnect_task.done():
@@ -49,6 +58,9 @@ class PhysicalNodeManager:
                 self._start_reconnect_loop()
 
     async def _do_connect(self):
+        # Firmware serves a single API client: close any stale connection first
+        # so we don't leave half-open sockets behind on every reconnect.
+        await self._close_transport()
         if self._config.connection_type == "serial":
             import serial_asyncio
             self._reader, self._writer = await serial_asyncio.open_serial_connection(
@@ -59,10 +71,12 @@ class PhysicalNodeManager:
             self._reader, self._writer = await asyncio.open_connection(
                 self._config.tcp_host, self._config.tcp_port,
             )
+            self._enable_tcp_keepalive()
             await self._send_want_config()
             logger.info("Sent want_config_id to tcp node")
         self._connected = True
         self._last_data_time = time.time()
+        self._last_heartbeat_time = time.time()
         self._my_info_captured.clear()
         self._metadata_captured.clear()
         logger.info(f"Connected to {self._config.connection_type} node")
@@ -70,6 +84,43 @@ class PhysicalNodeManager:
         if self._did_initial_connect and self._on_reconnect:
             asyncio.create_task(self._on_reconnect())
         self._did_initial_connect = True
+
+    def _enable_tcp_keepalive(self) -> None:
+        """Let the kernel detect a dead node (power loss, WiFi drop) instead of
+        relying on mesh traffic gaps, which are normal on a quiet mesh."""
+        sock = self._writer.get_extra_info("socket") if self._writer else None
+        if sock is None:
+            return
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except OSError as e:
+            logger.debug(f"Could not enable TCP keepalive: {e}")
+
+    async def _close_transport(self) -> None:
+        if self._writer:
+            try:
+                self._writer.close()
+                if hasattr(self._writer, "wait_closed"):
+                    await asyncio.wait_for(self._writer.wait_closed(), timeout=2.0)
+            except Exception:
+                pass
+        self._reader = None
+        self._writer = None
+
+    async def _send_heartbeat(self) -> None:
+        """Keep the firmware's phone-API session alive (like the official clients do)."""
+        self._last_heartbeat_time = time.time()
+        to_radio = mesh_pb2.ToRadio()
+        to_radio.heartbeat.CopyFrom(mesh_pb2.Heartbeat())
+        try:
+            self._writer.write(encode_frame(to_radio.SerializeToString()))
+            await self._writer.drain()
+        except Exception as e:
+            logger.debug(f"Heartbeat send failed: {e}")
 
     async def _send_want_config(self):
         import random
@@ -122,6 +173,8 @@ class PhysicalNodeManager:
                 self._last_data_time = time.time()
                 poked = False
             except asyncio.TimeoutError:
+                if time.time() - self._last_heartbeat_time > HEARTBEAT_INTERVAL_SECONDS:
+                    await self._send_heartbeat()
                 silent = time.time() - self._last_data_time
                 # Serial: poke the link once before giving up on it.
                 if is_serial and poke_timeout > 0 and not poked and silent > poke_timeout:
@@ -178,8 +231,33 @@ class PhysicalNodeManager:
                 fw = fr.metadata.firmware_version or "unknown"
                 logger.info(f"Captured metadata: firmware_version={fw}")
                 self._metadata_captured.set()
+            elif fr.HasField("config"):
+                sub = fr.config.WhichOneof("payload_variant")
+                if sub:
+                    self.config_frames[sub] = from_radio_bytes
+            elif fr.HasField("moduleConfig"):
+                sub = fr.moduleConfig.WhichOneof("payload_variant")
+                if sub:
+                    self.module_config_frames[sub] = from_radio_bytes
+            elif fr.config_complete_id:
+                logger.info(f"Node config dump complete: {len(self.config_frames)} configs, "
+                            f"{len(self.module_config_frames)} module configs")
         except Exception:
             pass
+
+    def schedule_resync(self, delay: float = 3.0) -> None:
+        """Re-read the node's config dump shortly after a client changed settings,
+        so the replay cache (configs, own position, channels) doesn't go stale.
+        Debounced: a burst of admin writes triggers a single re-read."""
+        if self._resync_task and not self._resync_task.done():
+            self._resync_task.cancel()
+        self._resync_task = asyncio.create_task(self._resync_after(delay))
+
+    async def _resync_after(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if self._connected and self._writer:
+            logger.info("Re-reading node config after client settings change")
+            await self._send_want_config()
 
     def set_on_reconnect(self, callback: Callable[[], Awaitable[None]]):
         self._on_reconnect = callback

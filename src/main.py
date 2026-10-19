@@ -107,6 +107,12 @@ async def main() -> None:
     logger.info(f"Mock mode: {args.mock}")
     logger.info(f"Server port: {app_config.server.port}")
     logger.info(f"Physical node: {app_config.physical_node.connection_type}")
+    for entry in app_config.security.allow_admin_from_ips:
+        if entry.strip() in ("0.0.0.0", "::"):
+            logger.warning(
+                f"allow_admin_from_ips entry '{entry}' only matches that literal address; "
+                f"use '0.0.0.0/0' to allow all IPv4 clients or a subnet such as '192.168.1.0/24'"
+            )
 
     if args.mock:
         logger.info("Using mock physical node (no real hardware required)")
@@ -141,7 +147,9 @@ async def main() -> None:
             fw_version = phys_mgr.metadata.firmware_version if phys_mgr.metadata else None
             config_capture.capture_defaults(phys_mgr.my_node_num, synthetic_nodes=80, firmware_version=fw_version)
             logger.info(f"Config re-captured: {config_capture.message_count} messages")
-            await server.refresh_all_clients()
+            # Connected apps keep their state and pick up fresh data on their next
+            # want_config; pushing an unsolicited ~1000-message replay to each of
+            # them on every reconnect only stalls the apps.
         except Exception as e:
             logger.error(f"Reconnect handler failed: {e}")
 
@@ -204,6 +212,8 @@ async def main() -> None:
                 result = await ensure_mqtt_proxy(phys_mgr, node_num, has_net=has_net)
                 logger.info(f"Node provision result: {result}")
                 provision_snapshot = result.get("snapshot")
+                if result.get("changed") and hasattr(phys_mgr, "schedule_resync"):
+                    phys_mgr.schedule_resync()
             except Exception as e:
                 logger.warning(f"Node provision failed, continuing degraded: {e}")
 
@@ -394,9 +404,34 @@ async def _update_cache(from_radio_bytes: bytes, cache: StateCache, logger: logg
             "via_mqtt": pkt.via_mqtt,
             "last_heard": pkt.rx_time,
         }
+        # Merge so position/device_metrics from earlier updates survive
+        node_info = {**cache.known_nodes.get(num, {}), **node_info}
         cache.update_known_node(node_info)
         if num == cache.my_node_num:
             logger.debug(f"Cache: own NodeInfo captured via NODEINFO_APP: {user.long_name}")
+            cache.update_node_info(node_info)
+        return
+
+    if decoded.portnum == portnums_pb2.POSITION_APP:
+        num = getattr(pkt, "from", 0)
+        existing = cache.known_nodes.get(num)
+        if existing is None:
+            return
+        try:
+            pos = mesh_pb2.Position()
+            pos.ParseFromString(decoded.payload)
+        except Exception:
+            return
+        if not (pos.latitude_i or pos.longitude_i):
+            return
+        node_info = {**existing, "position": {
+            "latitude_i": pos.latitude_i,
+            "longitude_i": pos.longitude_i,
+            "altitude": pos.altitude,
+            "time": pos.time or pkt.rx_time,
+        }}
+        cache.update_known_node(node_info)
+        if num == cache.my_node_num:
             cache.update_node_info(node_info)
 
 
@@ -413,9 +448,21 @@ async def _broadcast_callback(from_radio_bytes: bytes, server: "TCPServer", cach
         portnum = decoded.portnum
         pn_entry = _PORTNUM_LOOKUP.get(portnum)
         portnum_str = pn_entry.name if pn_entry else f"UNKNOWN[{portnum}]"
-        logger.debug(
+        extra = ""
+        log = logger.debug
+        if portnum == portnums_pb2.ROUTING_APP:
+            try:
+                routing = mesh_pb2.Routing()
+                routing.ParseFromString(decoded.payload)
+                reason = mesh_pb2.Routing.Error.Name(routing.error_reason)
+                extra = f" request_id={decoded.request_id} error={reason}"
+                if routing.error_reason != mesh_pb2.Routing.NONE:
+                    log = logger.info
+            except Exception:
+                pass
+        log(
             f"ch={pkt.channel} id={pkt.id} type={portnum_str} "
-            f"from={hex(getattr(pkt, 'from', 0))} to={hex(pkt.to)}"
+            f"from={hex(getattr(pkt, 'from', 0))} to={hex(pkt.to)}{extra}"
         )
     elif fr.HasField("my_info"):
         logger.debug(f"MyNodeInfo: node_num=0x{fr.my_info.my_node_num:08x}")

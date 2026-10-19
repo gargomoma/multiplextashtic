@@ -527,9 +527,13 @@ class ConfigReplayBuilder:
                 if entry["type"] == "metadata":
                     metadata_entry = entry
                     break
-            if metadata_entry:
+            real_metadata = getattr(self._phys_mgr, "metadata", None)
+            if real_metadata is not None or metadata_entry:
                 fr = mesh_pb2.FromRadio()
-                fr.ParseFromString(metadata_entry["data"])
+                if real_metadata is not None:
+                    fr.metadata.CopyFrom(real_metadata)
+                else:
+                    fr.ParseFromString(metadata_entry["data"])
                 if fr.metadata.device_state_version < 0:
                     fr.metadata.device_state_version = 0
                 if fr.metadata.position_flags < 0:
@@ -580,6 +584,15 @@ class ConfigReplayBuilder:
             logger.info(f"ConfigReplay: sent {channels_sent} channels")
 
         async def send_configs_and_module_configs():
+            # Prefer the node's real config dump so settings screens show actual values
+            real_frames = list(getattr(self._phys_mgr, "config_frames", {}).values())
+            real_module_frames = list(getattr(self._phys_mgr, "module_config_frames", {}).values())
+            if real_frames:
+                for data in real_frames + real_module_frames:
+                    await send_captured(data)
+                logger.info(f"ConfigReplay: sent {len(real_frames)} configs and "
+                            f"{len(real_module_frames)} module configs from physical node")
+                return
             skip_types = {"myInfo", "ownNodeInfo", "metadata", "configComplete", "queueStatus", "fromRadio", "nodeInfo", "channel"}
             for entry in self._capture.get_config_messages():
                 etype = entry["type"]

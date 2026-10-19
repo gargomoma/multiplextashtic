@@ -33,9 +33,9 @@ Key differences from Yeraze:
 - **Heartbeat → QueueStatus** — responds to client heartbeats to keep iOS/Android apps alive
 - **Client lifecycle management** — inactivity timeout (5 min), cleanup loop (1 min), config request rate limiting (5 s)
 - **Bounded message queue** — max 100 messages with 10 ms send delay
-- **TCP idle timeout** — detects silent disconnects (no data for 30s), triggers exponential backoff reconnection
+- **TCP keepalive + heartbeat** — keeps the node session alive and detects dead links; idle timeout (default 300s) as a last resort, then exponential backoff reconnection
 - **Serial watchdog** — pokes the link after 45 s silence, reconnects after 90 s (handles USB re-enumeration with no EOF/error)
-- **Config re-capture on reconnect** — re-captures config and refreshes all connected clients
+- **Config re-capture on reconnect** — re-captures config silently; connected clients keep streaming
 - **Node auto-provisioning** — once per boot, enables node MQTT when the MQTT bridge is on (false→true only, verified by read-back; network-capable nodes get `mqtt.enabled` only, others get both flags; never touches address/credentials)
 - **MQTT bridge** — proxy-relay uplink plus optional raw gateway (`raw/...`) and standard mirror (`msh/...`), with optional secondary broker (`broker2`); see `docs/dual-mqtt-easy.md` and `docs/dual-mqtt-technical.md`
 - **Mock mode** — run without real hardware for development/testing
@@ -84,7 +84,7 @@ physical_node:
   # TCP settings (used when connection_type = "tcp")
   tcp_host: "192.168.1.100"
   tcp_port: 4403
-  tcp_idle_timeout: 30           # seconds without data before assuming TCP disconnect
+  tcp_idle_timeout: 300          # seconds without data before assuming TCP disconnect
   serial_poke_timeout: 45        # serial: poke link with want_config after Ns silence
   serial_idle_timeout: 90        # serial: reconnect after Ns silence (USB re-enumeration)
   reconnect:

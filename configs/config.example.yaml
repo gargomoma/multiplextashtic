@@ -17,7 +17,8 @@ physical_node:
   tcp_port: 4403
 
   baud_rate: 115200
-  tcp_idle_timeout: 30         # seconds without data before assuming TCP disconnect (0 = disabled)
+  tcp_idle_timeout: 300        # seconds without data before assuming TCP disconnect (0 = disabled).
+                               # Dead links are caught sooner by TCP keepalive; keep this well above normal mesh quiet gaps.
   serial_poke_timeout: 45      # serial: poke link with want_config after Ns silence
   serial_idle_timeout: 90      # serial: reconnect after Ns silence (USB re-enumeration; keep >60s telemetry)
 
@@ -41,7 +42,7 @@ virtual_node:
 security:
   blocked_portnums:
     - "ADMIN_APP"
-  allow_admin_from_ips: []       # IP/CIDR whitelist for admin commands (e.g. "192.168.1.0/24" for whole LAN)
+  allow_admin_from_ips: []       # IP/CIDR whitelist for admin commands (e.g. "192.168.1.0/24" for whole LAN, "0.0.0.0/0" for any)
 
 discovery:
   # mDNS (Avahi/Zeroconf) service discovery as _meshtastic._tcp.local.
