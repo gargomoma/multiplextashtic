@@ -18,6 +18,10 @@ LOCALHOST_IPS = {"127.0.0.1", "::1", "localhost"}
 # want_config_id. Clients get these from the config replay instead; forwarding
 # them would push a ~1000-node dump plus a foreign config_complete_id to every
 # connected app whenever the physical link reconnects.
+# Admin messages that don't change stored settings: apps send set_time_only on
+# every connect, so re-reading the node's config for it would be wasted work.
+NON_SETTINGS_ADMIN_VARIANTS = {"set_time_only"}
+
 CONFIG_DUMP_VARIANTS = {
     "my_info", "node_info", "config", "moduleConfig", "channel", "metadata",
     "config_complete_id", "fileInfo", "deviceuiConfig",
@@ -139,7 +143,8 @@ class MessageRouter:
                         logger.warning("Blocked addContact admin message (PKI keystore protection)")
                         return False, None, None
                     variant = admin_msg.WhichOneof("payload_variant")
-                    is_admin_write = bool(variant) and not variant.startswith("get_")
+                    is_admin_write = bool(variant) and variant not in NON_SETTINGS_ADMIN_VARIANTS \
+                        and variant.startswith(("set_", "remove_", "commit_"))
                 except Exception:
                     pass
 
